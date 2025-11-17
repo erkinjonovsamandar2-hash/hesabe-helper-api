@@ -64,7 +64,7 @@ const hesabeCrypt = new HesabeCrypt(SANDBOX_SECRET_KEY, SANDBOX_IV_KEY);
 // ---- 3. Express app setup ----
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.text({ type: '*/*' }));
 
 // Health check (optional)
 app.get("/", (req, res) => {
@@ -89,6 +89,23 @@ app.get("/", (req, res) => {
  */
 app.post("/hesabe/create-indirect-payment", async (req, res) => {
   try {
+    // 1) Parse JSON manually from text body
+    let payload;
+    if (typeof req.body === "string") {
+      try {
+        payload = JSON.parse(req.body);
+      } catch (e) {
+        console.error("Invalid JSON received from client:", req.body);
+        return res.status(400).json({
+          success: false,
+          message: "Invalid JSON in request body",
+          rawBody: req.body
+        });
+      }
+    } else {
+      payload = req.body || {};
+    }
+
     const {
       amount,
       currency,
@@ -104,7 +121,16 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
       variable3,
       variable4,
       variable5
-    } = req.body;
+    } = payload;
+
+    if (!amount || !currency || !orderReferenceNumber || !responseUrl || !failureUrl) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Missing required fields: amount, currency, orderReferenceNumber, responseUrl, failureUrl",
+        received: payload
+      });
+    }
 
     if (!amount || !currency || !orderReferenceNumber || !responseUrl || !failureUrl) {
       return res.status(400).json({
