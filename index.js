@@ -5,8 +5,7 @@ const bodyParser = require("body-parser");
 const axios = require("axios");
 const aesjs = require("aes-js");
 
-// ---- 1. HesabeCrypt implementation (adapted from official docs) ----
-// Ref: Hesabe Encryption Library (JS) :contentReference[oaicite:3]{index=3}
+// ---- 1. HesabeCrypt implementation ----
 class HesabeCrypt {
   constructor(secretKey, ivKey) {
     // secretKey: 32 chars, ivKey: 16 chars
@@ -47,28 +46,71 @@ class HesabeCrypt {
   }
 }
 
-// ---- 2. Config: sandbox keys (from docs) & URLs ----
-// These are PUBLIC sandbox values from the Hesabe docs, safe to use only for testing. :contentReference[oaicite:4]{index=4}
-const SANDBOX_MERCHANT_CODE = "842217";
-const SANDBOX_ACCESS_CODE = "c333729b-d060-4b74-a49d-7686a8353481";
-const SANDBOX_SECRET_KEY = "PkW64zMe5NVdrlPVNnjo2Jy9nOb7v1Xg";
-const SANDBOX_IV_KEY = "5NVdrlPVNnjo2Jy9";
+// ---- 2. Environment-based config: sandbox vs production ----
+const HESABE_ENV = process.env.HESABE_ENV || "sandbox"; // "sandbox" or "production"
 
-const HESABE_BASE_URL = "https://sandbox.hesabe.com";
+const SANDBOX_BASE_URL =
+  process.env.HESABE_SANDBOX_BASE_URL || "https://sandbox.hesabe.com";
+const LIVE_BASE_URL =
+  process.env.HESABE_LIVE_BASE_URL || "https://api.hesabe.com"; // set to real prod URL from docs
+
+const HESABE_BASE_URL =
+  HESABE_ENV === "production" ? LIVE_BASE_URL : SANDBOX_BASE_URL;
+
 const HESABE_CHECKOUT_URL = `${HESABE_BASE_URL}/checkout`;
 const HESABE_PAYMENT_URL = `${HESABE_BASE_URL}/payment`;
 
-// Create one HesabeCrypt instance for sandbox
-const hesabeCrypt = new HesabeCrypt(SANDBOX_SECRET_KEY, SANDBOX_IV_KEY);
+// Choose keys by environment
+const MERCHANT_CODE =
+  HESABE_ENV === "production"
+    ? process.env.HESABE_LIVE_MERCHANT_CODE
+    : process.env.HESABE_SANDBOX_MERCHANT_CODE;
+
+const ACCESS_CODE =
+  HESABE_ENV === "production"
+    ? process.env.HESABE_LIVE_ACCESS_CODE
+    : process.env.HESABE_SANDBOX_ACCESS_CODE;
+
+const SECRET_KEY =
+  HESABE_ENV === "production"
+    ? process.env.HESABE_LIVE_SECRET_KEY
+    : process.env.HESABE_SANDBOX_SECRET_KEY;
+
+const IV_KEY =
+  HESABE_ENV === "production"
+    ? process.env.HESABE_LIVE_IV_KEY
+    : process.env.HESABE_SANDBOX_IV_KEY;
+
+// basic sanity logs (won't print secrets)
+console.log("Hesabe helper starting with environment:", HESABE_ENV);
+console.log("Hesabe base URL:", HESABE_BASE_URL);
+
+// Simple guard – if any key missing, crash early (so Render shows error)
+if (!MERCHANT_CODE || !ACCESS_CODE || !SECRET_KEY || !IV_KEY) {
+  console.error("❌ Missing one or more Hesabe environment variables.");
+  console.error(
+    "Check HESABE_* env vars for",
+    HESABE_ENV === "production" ? "LIVE" : "SANDBOX"
+  );
+  process.exit(1);
+}
+
+// Create HesabeCrypt instance for current environment
+const hesabeCrypt = new HesabeCrypt(SECRET_KEY, IV_KEY);
 
 // ---- 3. Express app setup ----
 const app = express();
 app.use(cors());
-app.use(bodyParser.text({ type: '*/*' }));
+app.use(bodyParser.text({ type: "*/*" }));
 
 // Health check (optional)
 app.get("/", (req, res) => {
-  res.json({ ok: true, message: "Hesabe helper API running" });
+  res.json({
+    ok: true,
+    message: "Hesabe helper API running",
+    environment: HESABE_ENV,
+    baseUrl: HESABE_BASE_URL,
+  });
 });
 
 /**
@@ -84,8 +126,10 @@ app.get("/", (req, res) => {
  *   "name": "Customer Name",
  *   "mobile_number": "12345678",
  *   "email": "test@example.com",
- *   "webhookUrl": "https://yourapp.com/hesabe/webhook"   // optional
+ *   "callbackUrl": "https://hook.eu2.make.com/..."  // from Make
  * }
+ *
+ * Hesabe docs usually call it `webhookUrl`, so we map callbackUrl -> webhookUrl.
  */
 app.post("/hesabe/create-indirect-payment", async (req, res) => {
   try {
@@ -99,7 +143,7 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
         return res.status(400).json({
           success: false,
           message: "Invalid JSON in request body",
-          rawBody: req.body
+          rawBody: req.body,
         });
       }
     } else {
@@ -115,12 +159,16 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
       name,
       mobile_number,
       email,
-      webhookUrl,
+      // from Make:
+      callbackUrl, // we’ll map this to Hesabe's webhookUrl
+      // or if you ever send webhookUrl directly:
+      webhookUrl: incomingWebhookUrl,
+      // optional extras:
       variable1,
       variable2,
       variable3,
       variable4,
-      variable5
+      variable5,
     } = payload;
 
     if (!amount || !currency || !orderReferenceNumber || !responseUrl || !failureUrl) {
@@ -128,27 +176,24 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
         success: false,
         message:
           "Missing required fields: amount, currency, orderReferenceNumber, responseUrl, failureUrl",
-        received: payload
+        received: payload,
       });
     }
 
-    if (!amount || !currency || !orderReferenceNumber || !responseUrl || !failureUrl) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Missing required fields: amount, currency, orderReferenceNumber, responseUrl, failureUrl"
-      });
-    }
+    // Decide final webhook url: prefer callbackUrl, else webhookUrl, else undefined
+    const webhookUrl =
+      callbackUrl && callbackUrl.trim().length > 0
+        ? callbackUrl
+        : incomingWebhookUrl;
 
     // ---- 3.1 Build request payload expected by Hesabe (Indirect Payment) ----
-    // Ref: In-Direct Payment docs :contentReference[oaicite:5]{index=5}
     const requestPayload = {
-      merchantCode: SANDBOX_MERCHANT_CODE,
-      amount,                      // "10.000" format
-      paymentType: 0,              // 0 = Indirect
-      currency,                    // "KWD", etc.
-      responseUrl,                 // success redirect
-      failureUrl,                  // failure redirect
+      merchantCode: MERCHANT_CODE,
+      amount, // "10.000" format
+      paymentType: 0, // 0 = Indirect
+      currency, // "KWD", etc.
+      responseUrl, // success redirect
+      failureUrl, // failure redirect
       version: "2.0",
       orderReferenceNumber,
 
@@ -156,12 +201,13 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
       name,
       mobile_number,
       email,
+      // Hesabe name is usually `webhookUrl`, so we send under that key:
       webhookUrl,
       variable1,
       variable2,
       variable3,
       variable4,
-      variable5
+      variable5,
     };
 
     // ---- 3.2 Encrypt payload with HesabeCrypt ----
@@ -174,17 +220,15 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
       { data: encryptedData },
       {
         headers: {
-          accessCode: SANDBOX_ACCESS_CODE,
-          Accept: "application/json"
+          accessCode: ACCESS_CODE,
+          Accept: "application/json",
         },
-        // Important to treat raw response as text if needed
-        responseType: "text"
+        responseType: "text", // we expect encrypted text
       }
     );
 
     const rawData = checkoutResponse.data;
 
-    // In their PHP example they decrypt the whole response content. :contentReference[oaicite:6]{index=6}
     const decryptedStr = hesabeCrypt.decryptAes(rawData);
     const decryptedJson = JSON.parse(decryptedStr);
 
@@ -192,11 +236,11 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
       return res.status(400).json({
         success: false,
         message: decryptedJson.message || "Hesabe checkout failed",
-        hesabeRaw: decryptedJson
+        hesabeRaw: decryptedJson,
       });
     }
 
-    // Usually token for payment page lives in response.response.data
+    // Usually token for payment page lives in response.response.data or .token
     const token =
       decryptedJson?.response?.data ||
       decryptedJson?.response?.token ||
@@ -206,7 +250,7 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
       return res.status(500).json({
         success: false,
         message: "Could not find payment token in Hesabe response",
-        hesabeRaw: decryptedJson
+        hesabeRaw: decryptedJson,
       });
     }
 
@@ -216,10 +260,11 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
     return res.json({
       success: true,
       paymentUrl,
-      hesabeResponse: decryptedJson
+      hesabeResponse: decryptedJson,
+      environment: HESABE_ENV,
     });
-    } catch (err) {
-    console.error("Error in /hesabe/create-indirect-payment", err.message);
+  } catch (err) {
+    console.error("Error in /hesabe/create-indirect-payment:", err.message);
 
     let hesabeError = null;
 
@@ -230,7 +275,12 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
         console.error("Decrypted Hesabe error:", decryptedErr);
         hesabeError = decryptedErr;
       } catch (e) {
-        console.error("Could not decrypt Hesabe error:", e.message, "Raw:", err.response.data);
+        console.error(
+          "Could not decrypt Hesabe error:",
+          e.message,
+          "Raw:",
+          err.response.data
+        );
         hesabeError = err.response.data;
       }
     }
@@ -238,12 +288,13 @@ app.post("/hesabe/create-indirect-payment", async (req, res) => {
     return res.status(err.response?.status || 500).json({
       success: false,
       message: "Hesabe error",
-      hesabeError
+      hesabeError,
+      environment: HESABE_ENV,
     });
   }
 });
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`Hesabe helper API listening on port ${PORT}`);
+  console.log(`Hesabe helper API listening on port ${PORT} (env: ${HESABE_ENV})`);
 });
